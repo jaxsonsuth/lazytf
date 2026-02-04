@@ -1,0 +1,5 @@
+accounts:
+  prod:
+    aws_profile: "prod-org-admin"
+    region: "usw-2"
+    composition_path: "compositions/non-prod-231231231/usw-2"
