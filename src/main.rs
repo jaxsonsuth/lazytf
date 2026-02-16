@@ -170,14 +170,27 @@ impl AppState {
         }
 
         let mut accounts = Vec::with_capacity(config.accounts.len());
+        let mut startup_lines =
+            vec!["lazytf ready. Press `a` to authenticate selected account.".to_string()];
+
         for (name, account_cfg) in config.accounts {
-            let composition_path = resolve_composition_path(cwd, &account_cfg.composition_path)
-                .wrap_err_with(|| {
-                    format!(
-                        "Failed to resolve composition path for account `{name}`: {}",
-                        account_cfg.composition_path
-                    )
-                })?;
+            let composition_path =
+                match resolve_composition_path(cwd, &account_cfg.composition_path) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        let fallback =
+                            fallback_composition_path(cwd, &account_cfg.composition_path);
+                        startup_lines.push(format!(
+                            "warning: account `{name}` composition_path unresolved (`{}`): {err}",
+                            account_cfg.composition_path
+                        ));
+                        startup_lines.push(format!(
+                            "warning: using fallback path `{}` so UI can start",
+                            fallback.display()
+                        ));
+                        fallback
+                    }
+                };
 
             accounts.push(AccountState {
                 name,
@@ -194,9 +207,7 @@ impl AppState {
             selected_account: 0,
             selected_workspace: 0,
             focused_panel: FocusPanel::Accounts,
-            output_lines: vec![
-                "lazytf ready. Press `a` to authenticate selected account.".to_string(),
-            ],
+            output_lines: startup_lines,
             output_scroll_from_bottom: 0,
             status_line: "idle".to_string(),
             inflight: None,
@@ -1451,6 +1462,18 @@ fn resolve_composition_path(cwd: &Path, raw_path: &str) -> Result<PathBuf> {
     }
 
     Ok(path)
+}
+
+fn fallback_composition_path(cwd: &Path, raw_path: &str) -> PathBuf {
+    if raw_path.contains('*') || raw_path.contains('?') || raw_path.contains('[') {
+        return cwd.to_path_buf();
+    }
+
+    if Path::new(raw_path).is_absolute() {
+        PathBuf::from(raw_path)
+    } else {
+        cwd.join(raw_path)
+    }
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
