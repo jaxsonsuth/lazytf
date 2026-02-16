@@ -13,6 +13,9 @@ permissions:
 jobs:
   release:
     runs-on: macos-14
+    env:
+      TAP_REPO: jaxsonsuth/homebrew-lazytf
+      FORMULA_PATH: Formula/lazytf.rb
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,6 +43,16 @@ jobs:
           tar -C dist -czf lazytf-aarch64-apple-darwin.tar.gz lazytf
           shasum -a 256 lazytf-aarch64-apple-darwin.tar.gz > checksums.txt
 
+      - name: Derive metadata
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          VERSION="${TAG#v}"
+          SHA256="$(cut -d ' ' -f1 checksums.txt)"
+
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -49,3 +62,53 @@ jobs:
           files: |
             lazytf-aarch64-apple-darwin.tar.gz
             checksums.txt
+
+      - name: Checkout Homebrew tap
+        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TAP_REPO }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update Homebrew formula
+        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        run: |
+          mkdir -p "tap/Formula"
+
+          cat > "tap/${FORMULA_PATH}" <<EOF
+          class Lazytf < Formula
+            desc "Terminal UI for Terraform workflows"
+            homepage "https://github.com/jaxsonsuth/lazytf"
+            url "https://github.com/jaxsonsuth/lazytf/releases/download/${TAG}/lazytf-aarch64-apple-darwin.tar.gz"
+            sha256 "${SHA256}"
+            version "${VERSION}"
+
+            depends_on arch: :arm64
+
+            def install
+              bin.install "lazytf"
+            end
+
+            test do
+              assert_predicate bin/"lazytf", :exist?
+            end
+          end
+          EOF
+
+      - name: Commit Homebrew formula update
+        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        run: |
+          if [[ -z "$(git -C tap status --porcelain)" ]]; then
+            echo "No Homebrew formula change detected"
+            exit 0
+          fi
+
+          git -C tap add "${FORMULA_PATH}"
+          git -C tap -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "lazytf ${VERSION}"
+          git -C tap push
+
+      - name: Tap token missing
+        if: ${{ secrets.HOMEBREW_TAP_TOKEN == '' }}
+        run: |
+          echo "HOMEBREW_TAP_TOKEN not configured; skipping Homebrew tap update."

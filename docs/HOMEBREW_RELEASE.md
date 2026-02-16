@@ -1,6 +1,6 @@
 # Homebrew Release Notes
 
-This project ships a manual release workflow for macOS arm64 and a Homebrew formula template.
+This project ships a manual release workflow for macOS arm64 and can auto-update the Homebrew tap formula.
 
 ## 1) Create a release artifact
 
@@ -14,7 +14,19 @@ The release uploads:
 - `lazytf-aarch64-apple-darwin.tar.gz`
 - `checksums.txt`
 
-## 2) Update Homebrew tap formula
+## 2) Optional one-time setup for automatic tap updates
+
+If you want releases to update Homebrew automatically:
+
+1. In `jaxsonsuth/lazytf`, open `Settings` -> `Secrets and variables` -> `Actions`.
+2. Add a repository secret named `HOMEBREW_TAP_TOKEN`.
+3. Use a GitHub token that has write access to `jaxsonsuth/homebrew-lazytf`.
+
+With that secret configured, every release run updates and pushes:
+
+- `Formula/lazytf.rb` in `jaxsonsuth/homebrew-lazytf`
+
+## 3) Manual tap update (fallback)
 
 Use a separate tap repository, for example:
 
@@ -34,7 +46,7 @@ Set values:
 - `sha256` from `checksums.txt`.
 - `version` to match the tag version (without `v`).
 
-## 3) Install
+## 4) Install
 
 On any macOS arm64 machine:
 
