@@ -54,9 +54,22 @@ struct AccountState {
     aws_profile: String,
     region: Option<String>,
     composition_path: PathBuf,
+    composition_issue: Option<String>,
     var_files: Vec<PathBuf>,
     auth: AuthStatus,
     workspaces: Vec<String>,
+}
+
+#[derive(Debug)]
+struct LoadedConfig {
+    path: PathBuf,
+    base_dir: PathBuf,
+    config: Config,
+}
+
+#[derive(Debug, Default)]
+struct CliOptions {
+    config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +214,7 @@ struct AppState {
 }
 
 impl AppState {
-    fn from_config(config: Config, cwd: &Path) -> Result<Self> {
+    fn from_config(config: Config, config_base_dir: &Path) -> Result<Self> {
         if config.accounts.is_empty() {
             return Err(eyre!(
                 "Config has no accounts. Add at least one account under `accounts:`"
@@ -213,23 +226,26 @@ impl AppState {
             vec!["lazytf ready. Press `a` to authenticate selected account.".to_string()];
 
         for (name, account_cfg) in config.accounts {
-            let composition_path =
-                match resolve_composition_path(cwd, &account_cfg.composition_path) {
-                    Ok(path) => path,
-                    Err(err) => {
-                        let fallback =
-                            fallback_composition_path(cwd, &account_cfg.composition_path);
-                        startup_lines.push(format!(
-                            "warning: account `{name}` composition_path unresolved (`{}`): {err}",
-                            account_cfg.composition_path
-                        ));
-                        startup_lines.push(format!(
-                            "warning: using fallback path `{}` so UI can start",
+            let (composition_path, composition_issue) = match resolve_composition_path(
+                config_base_dir,
+                &account_cfg.composition_path,
+            ) {
+                Ok(path) => (path, None),
+                Err(err) => {
+                    let fallback =
+                        fallback_composition_path(config_base_dir, &account_cfg.composition_path);
+                    let issue = format!(
+                        "composition_path `{}` invalid: {err}",
+                        account_cfg.composition_path
+                    );
+                    startup_lines.push(format!("warning: account `{name}` {issue}"));
+                    startup_lines.push(format!(
+                            "warning: using fallback path `{}` so UI can start; execution remains blocked until fixed",
                             fallback.display()
                         ));
-                        fallback
-                    }
-                };
+                    (fallback, Some(issue))
+                }
+            };
 
             accounts.push(AccountState {
                 name,
@@ -237,6 +253,7 @@ impl AppState {
                 region: account_cfg.region,
                 var_files: resolve_var_file_paths(&account_cfg.var_files, &composition_path),
                 composition_path,
+                composition_issue,
                 auth: AuthStatus::Unknown,
                 workspaces: Vec::new(),
             });
@@ -405,9 +422,14 @@ struct RunOutcome {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
+    let cli_options = parse_cli_options()?;
     let cwd = std::env::current_dir().wrap_err("Unable to read current working directory")?;
-    let config = load_config(&cwd)?;
-    let mut app = AppState::from_config(config, &cwd)?;
+    let loaded_config = load_config(&cwd, cli_options.config_path.as_deref())?;
+    let mut app = AppState::from_config(loaded_config.config, &loaded_config.base_dir)?;
+    app.push_output(format!(
+        "Loaded config from {}",
+        loaded_config.path.display()
+    ));
 
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerEvent>();
     let (ctrlc_tx, mut ctrlc_rx) = mpsc::unbounded_channel::<()>();
@@ -954,6 +976,15 @@ fn start_workspace_refresh(app: &mut AppState, event_tx: mpsc::UnboundedSender<W
         return;
     }
 
+    if let Err(err) = validate_composition_for_execution(&account) {
+        app.push_output(format!(
+            "Cannot refresh workspaces for `{}`: {err}",
+            account.name
+        ));
+        app.set_status("failed");
+        return;
+    }
+
     let account_idx = app.selected_account;
     let (cancel_tx, cancel_rx) = watch::channel(CancelSignal::None);
     app.inflight = Some(InflightOperation {
@@ -1039,6 +1070,12 @@ fn start_terraform_operation(
 
     if account.auth != AuthStatus::Authenticated {
         app.push_output("Selected account is not authenticated. Press `a` first.");
+        return;
+    }
+
+    if let Err(err) = validate_operation_preflight(&account, kind) {
+        app.push_output(format!("Cannot run {}: {err}", kind.label()));
+        app.set_status("failed");
         return;
     }
 
@@ -1174,6 +1211,8 @@ async fn run_terraform_operation(
     cancel_rx: watch::Receiver<CancelSignal>,
     event_tx: mpsc::UnboundedSender<WorkerEvent>,
 ) -> Result<RunOutcome> {
+    validate_operation_preflight(&account, kind)?;
+
     if kind.requires_workspace() {
         let _ = event_tx.send(WorkerEvent::OutputLine(format!(
             "Selecting workspace `{}` in `{}`",
@@ -1201,21 +1240,6 @@ async fn run_terraform_operation(
         OperationKind::TerraformPlan | OperationKind::TerraformApply
     ) && !account.var_files.is_empty()
     {
-        let missing_files: Vec<String> = account
-            .var_files
-            .iter()
-            .filter(|path| !path.exists())
-            .map(|path| path.display().to_string())
-            .collect();
-
-        if !missing_files.is_empty() {
-            return Err(eyre!(
-                "Configured var_files are missing for `{}`: {}",
-                account.name,
-                missing_files.join(", ")
-            ));
-        }
-
         let _ = event_tx.send(WorkerEvent::OutputLine(format!(
             "Using var files: {}",
             account
@@ -1298,6 +1322,8 @@ async fn check_auth(account: &AccountState) -> Result<bool> {
 }
 
 async fn fetch_workspaces(account: &AccountState) -> Result<Vec<String>> {
+    validate_composition_for_execution(account)?;
+
     let mut command = terraform_command(account, &["workspace", "list"]);
     let output = command
         .output()
@@ -1330,6 +1356,67 @@ fn parse_workspace_output(output: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn validate_composition_for_execution(account: &AccountState) -> Result<()> {
+    if let Some(issue) = &account.composition_issue {
+        return Err(eyre!(
+            "Account `{}` configuration is invalid: {}",
+            account.name,
+            issue
+        ));
+    }
+
+    if !account.composition_path.exists() {
+        return Err(eyre!(
+            "composition_path does not exist for `{}`: {}",
+            account.name,
+            account.composition_path.display()
+        ));
+    }
+
+    if !account.composition_path.is_dir() {
+        return Err(eyre!(
+            "composition_path is not a directory for `{}`: {}",
+            account.name,
+            account.composition_path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_var_files_for_execution(account: &AccountState) -> Result<()> {
+    let missing_files: Vec<String> = account
+        .var_files
+        .iter()
+        .filter(|path| !path.exists())
+        .map(|path| path.display().to_string())
+        .collect();
+
+    if missing_files.is_empty() {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "Configured var_files are missing for `{}`: {}",
+            account.name,
+            missing_files.join(", ")
+        ))
+    }
+}
+
+fn validate_operation_preflight(account: &AccountState, kind: OperationKind) -> Result<()> {
+    validate_composition_for_execution(account)?;
+
+    if matches!(
+        kind,
+        OperationKind::TerraformPlan | OperationKind::TerraformApply
+    ) && !account.var_files.is_empty()
+    {
+        validate_var_files_for_execution(account)?;
+    }
+
+    Ok(())
 }
 
 fn append_var_file_args(args: &mut Vec<String>, var_files: &[PathBuf]) {
@@ -1773,8 +1860,49 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn load_config(cwd: &Path) -> Result<Config> {
-    let config_path = find_config_path(cwd)?;
+fn parse_cli_options() -> Result<CliOptions> {
+    let mut options = CliOptions::default();
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" | "--config" => {
+                let value = args.next().ok_or_else(|| {
+                    eyre!("Missing value for {arg}. Usage: lazytf --config <path>")
+                })?;
+                options.config_path = Some(PathBuf::from(value));
+            }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => {
+                return Err(eyre!(
+                    "Unknown argument `{arg}`. Usage: lazytf [--config <path>]"
+                ));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
+fn print_usage() {
+    println!("lazytf - terminal UI for Terraform workflows");
+    println!();
+    println!("Usage:");
+    println!("  lazytf [--config <path>]");
+    println!();
+    println!("Options:");
+    println!("  -c, --config <path>   Path to lazytf config YAML");
+    println!("  -h, --help            Show this help");
+}
+
+fn load_config(cwd: &Path, explicit_config: Option<&Path>) -> Result<LoadedConfig> {
+    let config_path = find_config_path(cwd, explicit_config)?;
+    let config_path = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.clone());
     let contents = fs::read_to_string(&config_path).wrap_err_with(|| {
         format!(
             "Failed to read config file at {}",
@@ -1782,15 +1910,40 @@ fn load_config(cwd: &Path) -> Result<Config> {
         )
     })?;
 
-    serde_yaml::from_str(&contents).wrap_err_with(|| {
+    let config: Config = serde_yaml::from_str(&contents).wrap_err_with(|| {
         format!(
             "Failed to parse YAML config at {}",
             config_path.to_string_lossy()
         )
+    })?;
+
+    let base_dir = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.to_path_buf());
+
+    Ok(LoadedConfig {
+        path: config_path,
+        base_dir,
+        config,
     })
 }
 
-fn find_config_path(cwd: &Path) -> Result<PathBuf> {
+fn find_config_path(cwd: &Path, explicit_config: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit_config {
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+
+        if resolved.exists() {
+            return Ok(resolved);
+        }
+
+        return Err(eyre!("Config file does not exist: {}", resolved.display()));
+    }
+
     for candidate in CONFIG_CANDIDATES {
         let path = cwd.join(candidate);
         if path.exists() {
