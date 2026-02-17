@@ -2,6 +2,21 @@
 
 This project ships a manual release workflow for macOS arm64 and can auto-update the Homebrew tap formula.
 
+## 0) Release checklist
+
+Before running the release workflow:
+
+1. Ensure `main` contains the changes you want to ship.
+2. Run local checks:
+   - `cargo fmt`
+   - `cargo check`
+3. Run a quick smoke flow against a real Terraform repo:
+   - auth/login
+   - workspace refresh
+   - plan
+   - cancel (graceful)
+4. Confirm release tag format is `vX.Y.Z`.
+
 ## 1) Create a release artifact
 
 1. Open `Actions` in `https://github.com/jaxsonsuth/lazytf`.
