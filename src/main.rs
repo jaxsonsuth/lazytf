@@ -196,6 +196,7 @@ struct AppState {
     status_line: String,
     inflight: Option<InflightOperation>,
     pending_apply_confirmation: bool,
+    show_help: bool,
     quit_requested: bool,
 }
 
@@ -253,6 +254,7 @@ impl AppState {
             status_line: "idle".to_string(),
             inflight: None,
             pending_apply_confirmation: false,
+            show_help: false,
             quit_requested: false,
         })
     }
@@ -302,6 +304,14 @@ impl AppState {
 
     fn clear_apply_confirmation(&mut self) {
         self.pending_apply_confirmation = false;
+    }
+
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
+    fn close_help(&mut self) {
+        self.show_help = false;
     }
 
     fn request_cancel(&mut self) {
@@ -545,6 +555,23 @@ fn handle_key_event(
     key: KeyEvent,
     worker_tx: &mpsc::UnboundedSender<WorkerEvent>,
 ) {
+    if key.code == KeyCode::Char('?') {
+        app.toggle_help();
+        app.clear_apply_confirmation();
+        return;
+    }
+
+    if app.show_help {
+        if key.code == KeyCode::Esc {
+            app.close_help();
+            return;
+        }
+
+        if key.code != KeyCode::Char('q') && key.code != KeyCode::Char('c') {
+            return;
+        }
+    }
+
     if key.code == KeyCode::Esc {
         app.exit_output_only();
         app.clear_apply_confirmation();
@@ -1471,14 +1498,14 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     let help = if app.is_output_only() {
         vec![
             Line::from(
-                "z/esc:exit fullscreen  pgup/pgdn g/G mouse:scroll  c:cancel (again=force)  q:quit",
+                "z/esc:exit fullscreen  ?:help  pgup/pgdn g/G mouse:scroll  c:cancel (again=force)  q:quit",
             ),
             Line::from("output-only mode for plan review"),
         ]
     } else {
         vec![
             Line::from(
-                "j/k or arrows: move  tab/h/l: panel  z:fullscreen output  a:aws login  s:auth check  r:workspaces",
+                "j/k or arrows: move  tab/h/l: panel  z:fullscreen output  ?:help  a:aws login  s:auth check  r:workspaces",
             ),
             Line::from(
                 "i:init  p:plan  A then y:apply  c:cancel (again=force)  q:quit  pgup/pgdn g/G/mouse:output scroll",
@@ -1489,6 +1516,10 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
 
     if app.pending_apply_confirmation {
         draw_apply_confirmation(frame);
+    }
+
+    if app.show_help {
+        draw_help_modal(frame);
     }
 }
 
@@ -1674,6 +1705,48 @@ fn draw_apply_confirmation(frame: &mut ratatui::Frame<'_>) {
             .border_style(
                 Style::default()
                     .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+    );
+    frame.render_widget(popup, area);
+}
+
+fn draw_help_modal(frame: &mut ratatui::Frame<'_>) {
+    let area = centered_rect(82, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    let help_lines = vec![
+        Line::from(Span::styled(
+            "lazytf keybindings",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Global:"),
+        Line::from("  ?: toggle help   q: quit   Ctrl+C: graceful quit"),
+        Line::from("  c: cancel running command (press again to force kill)"),
+        Line::from(""),
+        Line::from("Layout & Focus:"),
+        Line::from("  z: toggle output fullscreen   Esc: exit fullscreen/help"),
+        Line::from("  Tab/Shift+Tab or h/l: move focus between panels"),
+        Line::from(""),
+        Line::from("Navigation:"),
+        Line::from("  j/k or arrows: move selection   g/G or Home/End: output top/bottom"),
+        Line::from("  PgUp/PgDn or mouse wheel: scroll output"),
+        Line::from(""),
+        Line::from("Actions:"),
+        Line::from("  a: aws sso login   s: auth check   r: refresh workspaces"),
+        Line::from("  i: terraform init   p: terraform plan   A then y: terraform apply"),
+    ];
+
+    let popup = Paragraph::new(help_lines).block(
+        Block::default()
+            .title("Help")
+            .borders(Borders::ALL)
+            .border_style(
+                Style::default()
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
     );
