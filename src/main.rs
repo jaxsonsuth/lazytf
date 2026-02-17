@@ -8,7 +8,10 @@ use std::{
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use crossterm::{
-    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -19,7 +22,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use serde::Deserialize;
 use tokio::{
@@ -41,6 +44,8 @@ struct AccountConfig {
     aws_profile: String,
     composition_path: String,
     region: Option<String>,
+    #[serde(default)]
+    var_files: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +54,7 @@ struct AccountState {
     aws_profile: String,
     region: Option<String>,
     composition_path: PathBuf,
+    var_files: Vec<PathBuf>,
     auth: AuthStatus,
     workspaces: Vec<String>,
 }
@@ -196,6 +202,7 @@ impl AppState {
                 name,
                 aws_profile: account_cfg.aws_profile,
                 region: account_cfg.region,
+                var_files: resolve_var_file_paths(&account_cfg.var_files, &composition_path),
                 composition_path,
                 auth: AuthStatus::Unknown,
                 workspaces: Vec::new(),
@@ -367,6 +374,9 @@ fn run_event_loop(
                 CEvent::Key(key) if key.kind == KeyEventKind::Press => {
                     handle_key_event(app, key, worker_tx);
                 }
+                CEvent::Mouse(mouse) => {
+                    handle_mouse_event(app, mouse);
+                }
                 CEvent::Resize(_, _) => {}
                 _ => {}
             }
@@ -476,10 +486,6 @@ fn handle_key_event(
         return;
     }
 
-    if app.is_busy() {
-        return;
-    }
-
     match key.code {
         KeyCode::Tab => {
             app.focused_panel = app.focused_panel.next();
@@ -501,32 +507,84 @@ fn handle_key_event(
             move_selection_down(app);
             app.clear_apply_confirmation();
         }
+        KeyCode::PageUp => {
+            if app.focused_panel == FocusPanel::Output {
+                app.output_scroll_from_bottom = app.output_scroll_from_bottom.saturating_add(10);
+            }
+            app.clear_apply_confirmation();
+        }
+        KeyCode::PageDown => {
+            if app.focused_panel == FocusPanel::Output {
+                app.output_scroll_from_bottom = app.output_scroll_from_bottom.saturating_sub(10);
+            }
+            app.clear_apply_confirmation();
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            if app.focused_panel == FocusPanel::Output {
+                app.output_scroll_from_bottom = usize::MAX;
+            }
+            app.clear_apply_confirmation();
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            if app.focused_panel == FocusPanel::Output {
+                app.output_scroll_from_bottom = 0;
+            }
+            app.clear_apply_confirmation();
+        }
         KeyCode::Char('a') => {
+            if app.is_busy() {
+                app.push_output("Another operation is already running. Press `c` to cancel.");
+                return;
+            }
             start_auth_login(app, worker_tx.clone());
             app.clear_apply_confirmation();
         }
         KeyCode::Char('s') => {
+            if app.is_busy() {
+                app.push_output("Another operation is already running. Press `c` to cancel.");
+                return;
+            }
             start_auth_check_for_selected(app, worker_tx.clone());
             app.clear_apply_confirmation();
         }
         KeyCode::Char('r') => {
+            if app.is_busy() {
+                app.push_output("Another operation is already running. Press `c` to cancel.");
+                return;
+            }
             start_workspace_refresh(app, worker_tx.clone());
             app.clear_apply_confirmation();
         }
         KeyCode::Char('i') => {
+            if app.is_busy() {
+                app.push_output("Another operation is already running. Press `c` to cancel.");
+                return;
+            }
             start_terraform_operation(app, worker_tx.clone(), OperationKind::TerraformInit);
             app.clear_apply_confirmation();
         }
         KeyCode::Char('p') => {
+            if app.is_busy() {
+                app.push_output("Another operation is already running. Press `c` to cancel.");
+                return;
+            }
             start_terraform_operation(app, worker_tx.clone(), OperationKind::TerraformPlan);
             app.clear_apply_confirmation();
         }
         KeyCode::Char('A') => {
+            if app.is_busy() {
+                app.push_output("Another operation is already running. Press `c` to cancel.");
+                return;
+            }
             app.pending_apply_confirmation = true;
             app.set_status("apply confirmation pending: press y to confirm");
             app.push_output("Apply requested. Press `y` to confirm apply, any nav key to cancel.");
         }
         KeyCode::Char('y') if app.pending_apply_confirmation => {
+            if app.is_busy() {
+                app.push_output("Another operation is already running. Press `c` to cancel.");
+                return;
+            }
             start_terraform_operation(app, worker_tx.clone(), OperationKind::TerraformApply);
         }
         _ => {
@@ -551,6 +609,22 @@ fn move_selection_up(app: &mut AppState) {
         FocusPanel::Output => {
             app.output_scroll_from_bottom = app.output_scroll_from_bottom.saturating_add(1);
         }
+    }
+}
+
+fn handle_mouse_event(app: &mut AppState, mouse: MouseEvent) {
+    if app.focused_panel != FocusPanel::Output {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.output_scroll_from_bottom = app.output_scroll_from_bottom.saturating_add(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.output_scroll_from_bottom = app.output_scroll_from_bottom.saturating_sub(3);
+        }
+        _ => {}
     }
 }
 
@@ -990,17 +1064,60 @@ async fn run_terraform_operation(
         }
     }
 
+    if matches!(
+        kind,
+        OperationKind::TerraformPlan | OperationKind::TerraformApply
+    ) && !account.var_files.is_empty()
+    {
+        let missing_files: Vec<String> = account
+            .var_files
+            .iter()
+            .filter(|path| !path.exists())
+            .map(|path| path.display().to_string())
+            .collect();
+
+        if !missing_files.is_empty() {
+            return Err(eyre!(
+                "Configured var_files are missing for `{}`: {}",
+                account.name,
+                missing_files.join(", ")
+            ));
+        }
+
+        let _ = event_tx.send(WorkerEvent::OutputLine(format!(
+            "Using var files: {}",
+            account
+                .var_files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
     let command = match kind {
         OperationKind::TerraformInit => {
             terraform_command(&account, &["init", "-input=false", "-no-color"])
         }
         OperationKind::TerraformPlan => {
-            terraform_command(&account, &["plan", "-input=false", "-no-color"])
+            let mut args = vec![
+                "plan".to_string(),
+                "-input=false".to_string(),
+                "-no-color".to_string(),
+            ];
+            append_var_file_args(&mut args, &account.var_files);
+            terraform_command_owned(&account, &args)
         }
-        OperationKind::TerraformApply => terraform_command(
-            &account,
-            &["apply", "-input=false", "-no-color", "-auto-approve"],
-        ),
+        OperationKind::TerraformApply => {
+            let mut args = vec![
+                "apply".to_string(),
+                "-input=false".to_string(),
+                "-no-color".to_string(),
+                "-auto-approve".to_string(),
+            ];
+            append_var_file_args(&mut args, &account.var_files);
+            terraform_command_owned(&account, &args)
+        }
         _ => {
             return Err(eyre!(
                 "Unsupported terraform operation for runner: {}",
@@ -1083,9 +1200,14 @@ fn parse_workspace_output(output: &str) -> Vec<String> {
         .collect()
 }
 
-fn terraform_command(account: &AccountState, args: &[&str]) -> Command {
+fn append_var_file_args(args: &mut Vec<String>, var_files: &[PathBuf]) {
+    for var_file in var_files {
+        args.push(format!("-var-file={}", var_file.display()));
+    }
+}
+
+fn terraform_base_command(account: &AccountState) -> Command {
     let mut command = Command::new("terraform");
-    command.args(args);
     command.current_dir(&account.composition_path);
     command.env("AWS_PROFILE", &account.aws_profile);
     command.env("AWS_SDK_LOAD_CONFIG", "1");
@@ -1096,6 +1218,18 @@ fn terraform_command(account: &AccountState, args: &[&str]) -> Command {
         command.env("AWS_DEFAULT_REGION", region);
     }
 
+    command
+}
+
+fn terraform_command(account: &AccountState, args: &[&str]) -> Command {
+    let mut command = terraform_base_command(account);
+    command.args(args);
+    command
+}
+
+fn terraform_command_owned(account: &AccountState, args: &[String]) -> Command {
+    let mut command = terraform_base_command(account);
+    command.args(args);
     command
 }
 
@@ -1226,7 +1360,9 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
 
     let help = vec![
         Line::from("j/k or arrows: move  tab/h/l: panel  a:aws login  s:auth check  r:workspaces"),
-        Line::from("i:init  p:plan  A then y:apply  c:cancel  q:quit"),
+        Line::from(
+            "i:init  p:plan  A then y:apply  c:cancel  q:quit  pgup/pgdn g/G/mouse:output scroll",
+        ),
     ];
     frame.render_widget(Paragraph::new(help), root[2]);
 
@@ -1322,25 +1458,30 @@ fn draw_output_panel(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect)
 
     let visible_rows = area.height.saturating_sub(2) as usize;
     let total_lines = app.output_lines.len();
-    let max_scroll = total_lines.saturating_sub(visible_rows);
-    let scroll = app.output_scroll_from_bottom.min(max_scroll);
+    let max_scroll_from_bottom = total_lines.saturating_sub(visible_rows);
+    let from_bottom = app.output_scroll_from_bottom.min(max_scroll_from_bottom);
+    let scroll_from_top = max_scroll_from_bottom.saturating_sub(from_bottom);
 
-    let end = total_lines.saturating_sub(scroll);
-    let start = end.saturating_sub(visible_rows);
-
-    let text: Vec<Line<'_>> = app.output_lines[start..end]
+    let text: Vec<Line<'_>> = app
+        .output_lines
         .iter()
         .map(|line| Line::from(line.as_str()))
         .collect();
 
+    let output_title = if from_bottom == 0 {
+        "Output".to_string()
+    } else {
+        format!("Output (scroll +{from_bottom})")
+    };
+
     let widget = Paragraph::new(text)
+        .scroll((scroll_from_top as u16, 0))
         .block(
             Block::default()
-                .title("Output")
+                .title(output_title)
                 .borders(Borders::ALL)
                 .border_style(border_style),
-        )
-        .wrap(Wrap { trim: false });
+        );
 
     frame.render_widget(widget, area);
 }
@@ -1464,6 +1605,20 @@ fn resolve_composition_path(cwd: &Path, raw_path: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn resolve_var_file_paths(raw_var_files: &[String], composition_path: &Path) -> Vec<PathBuf> {
+    raw_var_files
+        .iter()
+        .map(|raw| {
+            let raw_path = Path::new(raw);
+            if raw_path.is_absolute() {
+                raw_path.to_path_buf()
+            } else {
+                composition_path.join(raw_path)
+            }
+        })
+        .collect()
+}
+
 fn fallback_composition_path(cwd: &Path, raw_path: &str) -> PathBuf {
     if raw_path.contains('*') || raw_path.contains('?') || raw_path.contains('[') {
         return cwd.to_path_buf();
@@ -1479,7 +1634,8 @@ fn fallback_composition_path(cwd: &Path, raw_path: &str) -> PathBuf {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode().wrap_err("Failed to enable terminal raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).wrap_err("Failed to enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .wrap_err("Failed to enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend).wrap_err("Failed to initialize terminal backend")?;
     Ok(terminal)
@@ -1487,8 +1643,12 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     disable_raw_mode().wrap_err("Failed to disable terminal raw mode")?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .wrap_err("Failed to leave alternate screen")?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .wrap_err("Failed to leave alternate screen")?;
     terminal.show_cursor().wrap_err("Failed to show cursor")?;
     Ok(())
 }
