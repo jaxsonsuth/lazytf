@@ -161,11 +161,26 @@ impl OperationKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelSignal {
+    None,
+    Graceful,
+    Force,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelStage {
+    None,
+    GracefulRequested,
+    ForceRequested,
+}
+
 #[derive(Debug)]
 struct InflightOperation {
     kind: OperationKind,
     account_idx: usize,
-    cancel_tx: watch::Sender<bool>,
+    cancel_tx: watch::Sender<CancelSignal>,
+    cancel_stage: CancelStage,
 }
 
 #[derive(Debug)]
@@ -290,10 +305,31 @@ impl AppState {
     }
 
     fn request_cancel(&mut self) {
-        if let Some(op) = &self.inflight {
-            let _ = op.cancel_tx.send(true);
-            self.push_output("Cancellation requested. Sending SIGINT to running command...");
-            self.set_status("cancelling...");
+        if let Some(op) = self.inflight.as_mut() {
+            match op.cancel_stage {
+                CancelStage::None => {
+                    let _ = op.cancel_tx.send(CancelSignal::Graceful);
+                    op.cancel_stage = CancelStage::GracefulRequested;
+                    self.push_output(
+                        "Graceful cancel requested. Sending SIGINT and waiting for Terraform to clean up state lock...",
+                    );
+                    self.push_output("Press `c` again to force kill if absolutely necessary.");
+                    self.set_status("cancelling (graceful)...");
+                }
+                CancelStage::GracefulRequested => {
+                    let _ = op.cancel_tx.send(CancelSignal::Force);
+                    op.cancel_stage = CancelStage::ForceRequested;
+                    self.push_output(
+                        "Force kill requested. This may leave Terraform state locked.",
+                    );
+                    self.set_status("cancelling (forced)...");
+                }
+                CancelStage::ForceRequested => {
+                    self.push_output(
+                        "Force kill already requested. Waiting for process to exit...",
+                    );
+                }
+            }
         }
     }
 
@@ -739,11 +775,12 @@ fn start_auth_login(app: &mut AppState, event_tx: mpsc::UnboundedSender<WorkerEv
     };
 
     let account_idx = app.selected_account;
-    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (cancel_tx, cancel_rx) = watch::channel(CancelSignal::None);
     app.inflight = Some(InflightOperation {
         kind: OperationKind::AuthLogin,
         account_idx,
         cancel_tx,
+        cancel_stage: CancelStage::None,
     });
     app.set_status(format!("running aws sso login for {}", account.name));
 
@@ -891,11 +928,12 @@ fn start_workspace_refresh(app: &mut AppState, event_tx: mpsc::UnboundedSender<W
     }
 
     let account_idx = app.selected_account;
-    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (cancel_tx, cancel_rx) = watch::channel(CancelSignal::None);
     app.inflight = Some(InflightOperation {
         kind: OperationKind::RefreshWorkspaces,
         account_idx,
         cancel_tx,
+        cancel_stage: CancelStage::None,
     });
     app.set_status(format!("loading workspaces for {}", account.name));
 
@@ -990,12 +1028,13 @@ fn start_terraform_operation(
     };
 
     let account_idx = app.selected_account;
-    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (cancel_tx, cancel_rx) = watch::channel(CancelSignal::None);
 
     app.inflight = Some(InflightOperation {
         kind,
         account_idx,
         cancel_tx,
+        cancel_stage: CancelStage::None,
     });
     app.set_status(format!("running {} for {}", kind.label(), account.name));
 
@@ -1105,7 +1144,7 @@ async fn run_terraform_operation(
     kind: OperationKind,
     account: AccountState,
     workspace: String,
-    cancel_rx: watch::Receiver<bool>,
+    cancel_rx: watch::Receiver<CancelSignal>,
     event_tx: mpsc::UnboundedSender<WorkerEvent>,
 ) -> Result<RunOutcome> {
     if kind.requires_workspace() {
@@ -1301,7 +1340,7 @@ fn terraform_command_owned(account: &AccountState, args: &[String]) -> Command {
 
 async fn run_streaming_command(
     mut command: Command,
-    mut cancel_rx: watch::Receiver<bool>,
+    mut cancel_rx: watch::Receiver<CancelSignal>,
     event_tx: mpsc::UnboundedSender<WorkerEvent>,
 ) -> Result<RunOutcome> {
     command.stdout(Stdio::piped());
@@ -1326,26 +1365,37 @@ async fn run_streaming_command(
 
     let mut cancelled = false;
     let mut sigint_sent = false;
+    let mut force_kill_sent = false;
 
     let status = loop {
         tokio::select! {
             child_status = child.wait() => {
                 break child_status.wrap_err("Failed while waiting for command")?;
             }
-            changed = cancel_rx.changed(), if !sigint_sent => {
-                if changed.is_ok() && *cancel_rx.borrow() {
-                    cancelled = true;
-                    if let Some(pid) = child.id() {
-                        send_sigint(pid)?;
-                        let _ = event_tx.send(WorkerEvent::OutputLine("Sent SIGINT to running command.".to_string()));
-                        sigint_sent = true;
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() {
+                    match *cancel_rx.borrow() {
+                        CancelSignal::None => {}
+                        CancelSignal::Graceful => {
+                            cancelled = true;
+                            if !sigint_sent {
+                                if let Some(pid) = child.id() {
+                                    send_sigint(pid)?;
+                                    let _ = event_tx.send(WorkerEvent::OutputLine("Sent SIGINT to running command.".to_string()));
+                                }
+                                sigint_sent = true;
+                            }
+                        }
+                        CancelSignal::Force => {
+                            cancelled = true;
+                            if !force_kill_sent {
+                                let _ = event_tx.send(WorkerEvent::OutputLine("Force kill signal sent to running command.".to_string()));
+                                let _ = child.start_kill();
+                                force_kill_sent = true;
+                            }
+                        }
                     }
                 }
-            }
-            _ = tokio::time::sleep(Duration::from_secs(8)), if sigint_sent => {
-                let _ = event_tx.send(WorkerEvent::OutputLine("Command still running after SIGINT, forcing termination...".to_string()));
-                let _ = child.start_kill();
-                sigint_sent = false;
             }
         }
     };
@@ -1420,7 +1470,9 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
 
     let help = if app.is_output_only() {
         vec![
-            Line::from("z/esc:exit fullscreen  pgup/pgdn g/G mouse:scroll  c:cancel  q:quit"),
+            Line::from(
+                "z/esc:exit fullscreen  pgup/pgdn g/G mouse:scroll  c:cancel (again=force)  q:quit",
+            ),
             Line::from("output-only mode for plan review"),
         ]
     } else {
@@ -1429,7 +1481,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
                 "j/k or arrows: move  tab/h/l: panel  z:fullscreen output  a:aws login  s:auth check  r:workspaces",
             ),
             Line::from(
-                "i:init  p:plan  A then y:apply  c:cancel  q:quit  pgup/pgdn g/G/mouse:output scroll",
+                "i:init  p:plan  A then y:apply  c:cancel (again=force)  q:quit  pgup/pgdn g/G/mouse:output scroll",
             ),
         ]
     };
