@@ -122,6 +122,21 @@ impl FocusPanel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutMode {
+    Split,
+    OutputOnly,
+}
+
+impl LayoutMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::OutputOnly => "output",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperationKind {
     AuthLogin,
     RefreshWorkspaces,
@@ -159,6 +174,8 @@ struct AppState {
     selected_account: usize,
     selected_workspace: usize,
     focused_panel: FocusPanel,
+    previous_focus_panel: FocusPanel,
+    layout_mode: LayoutMode,
     output_lines: Vec<String>,
     output_scroll_from_bottom: usize,
     status_line: String,
@@ -214,6 +231,8 @@ impl AppState {
             selected_account: 0,
             selected_workspace: 0,
             focused_panel: FocusPanel::Accounts,
+            previous_focus_panel: FocusPanel::Accounts,
+            layout_mode: LayoutMode::Split,
             output_lines: startup_lines,
             output_scroll_from_bottom: 0,
             status_line: "idle".to_string(),
@@ -275,6 +294,35 @@ impl AppState {
             let _ = op.cancel_tx.send(true);
             self.push_output("Cancellation requested. Sending SIGINT to running command...");
             self.set_status("cancelling...");
+        }
+    }
+
+    fn is_output_only(&self) -> bool {
+        self.layout_mode == LayoutMode::OutputOnly
+    }
+
+    fn enter_output_only(&mut self) {
+        if self.layout_mode == LayoutMode::Split {
+            self.previous_focus_panel = self.focused_panel;
+        }
+        self.layout_mode = LayoutMode::OutputOnly;
+        self.focused_panel = FocusPanel::Output;
+    }
+
+    fn exit_output_only(&mut self) {
+        if self.layout_mode == LayoutMode::Split {
+            return;
+        }
+
+        self.layout_mode = LayoutMode::Split;
+        self.focused_panel = self.previous_focus_panel;
+    }
+
+    fn toggle_output_only(&mut self) {
+        if self.is_output_only() {
+            self.exit_output_only();
+        } else {
+            self.enter_output_only();
         }
     }
 }
@@ -461,6 +509,12 @@ fn handle_key_event(
     key: KeyEvent,
     worker_tx: &mpsc::UnboundedSender<WorkerEvent>,
 ) {
+    if key.code == KeyCode::Esc {
+        app.exit_output_only();
+        app.clear_apply_confirmation();
+        return;
+    }
+
     if key.code == KeyCode::Char('q') {
         if app.is_busy() {
             app.request_cancel();
@@ -487,17 +541,29 @@ fn handle_key_event(
     }
 
     match key.code {
+        KeyCode::Char('z') => {
+            app.toggle_output_only();
+            app.clear_apply_confirmation();
+        }
         KeyCode::Tab => {
-            app.focused_panel = app.focused_panel.next();
+            if !app.is_output_only() {
+                app.focused_panel = app.focused_panel.next();
+            }
         }
         KeyCode::BackTab => {
-            app.focused_panel = app.focused_panel.previous();
+            if !app.is_output_only() {
+                app.focused_panel = app.focused_panel.previous();
+            }
         }
         KeyCode::Left | KeyCode::Char('h') => {
-            app.focused_panel = app.focused_panel.previous();
+            if !app.is_output_only() {
+                app.focused_panel = app.focused_panel.previous();
+            }
         }
         KeyCode::Right | KeyCode::Char('l') => {
-            app.focused_panel = app.focused_panel.next();
+            if !app.is_output_only() {
+                app.focused_panel = app.focused_panel.next();
+            }
         }
         KeyCode::Up | KeyCode::Char('k') => {
             move_selection_up(app);
@@ -1338,13 +1404,43 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "| {} | focus: {:?}",
+            "| {} | mode: {} | focus: {:?}",
             app.current_operation_label(),
+            app.layout_mode.label(),
             app.focused_panel
         )),
     ]);
     frame.render_widget(title, root[0]);
 
+    if app.is_output_only() {
+        draw_output_only_layout(frame, app, root[1]);
+    } else {
+        draw_split_layout(frame, app, root[1]);
+    }
+
+    let help = if app.is_output_only() {
+        vec![
+            Line::from("z/esc:exit fullscreen  pgup/pgdn g/G mouse:scroll  c:cancel  q:quit"),
+            Line::from("output-only mode for plan review"),
+        ]
+    } else {
+        vec![
+            Line::from(
+                "j/k or arrows: move  tab/h/l: panel  z:fullscreen output  a:aws login  s:auth check  r:workspaces",
+            ),
+            Line::from(
+                "i:init  p:plan  A then y:apply  c:cancel  q:quit  pgup/pgdn g/G/mouse:output scroll",
+            ),
+        ]
+    };
+    frame.render_widget(Paragraph::new(help), root[2]);
+
+    if app.pending_apply_confirmation {
+        draw_apply_confirmation(frame);
+    }
+}
+
+fn draw_split_layout(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1352,23 +1448,15 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
             Constraint::Percentage(28),
             Constraint::Percentage(44),
         ])
-        .split(root[1]);
+        .split(area);
 
     draw_accounts_panel(frame, app, columns[0]);
     draw_workspaces_panel(frame, app, columns[1]);
     draw_output_panel(frame, app, columns[2]);
+}
 
-    let help = vec![
-        Line::from("j/k or arrows: move  tab/h/l: panel  a:aws login  s:auth check  r:workspaces"),
-        Line::from(
-            "i:init  p:plan  A then y:apply  c:cancel  q:quit  pgup/pgdn g/G/mouse:output scroll",
-        ),
-    ];
-    frame.render_widget(Paragraph::new(help), root[2]);
-
-    if app.pending_apply_confirmation {
-        draw_apply_confirmation(frame);
-    }
+fn draw_output_only_layout(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    draw_output_panel(frame, app, area);
 }
 
 fn draw_accounts_panel(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
@@ -1465,7 +1553,7 @@ fn draw_output_panel(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect)
     let text: Vec<Line<'_>> = app
         .output_lines
         .iter()
-        .map(|line| Line::from(line.as_str()))
+        .map(|line| styled_output_line(line))
         .collect();
 
     let output_title = if from_bottom == 0 {
@@ -1484,6 +1572,38 @@ fn draw_output_panel(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect)
         );
 
     frame.render_widget(widget, area);
+}
+
+fn styled_output_line(line: &str) -> Line<'static> {
+    let trimmed = line.trim_start();
+
+    let style = if trimmed.contains("Error:") {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if trimmed.contains("Warning:") {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if trimmed.starts_with('~') {
+        Style::default().fg(Color::Yellow)
+    } else if trimmed.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if trimmed.starts_with("Plan:") {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with("Apply complete!") || trimmed.starts_with("No changes.") {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with("Running `") || trimmed.starts_with("Using var files:") {
+        Style::default().fg(Color::Blue)
+    } else {
+        Style::default()
+    };
+
+    Line::from(Span::styled(line.to_string(), style))
 }
 
 fn draw_apply_confirmation(frame: &mut ratatui::Frame<'_>) {
