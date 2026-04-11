@@ -1,6 +1,7 @@
 # lazytf
 
 Terminal UI for Terraform workflows.
+This is a test
 
 ## Install
 
